@@ -393,6 +393,189 @@ func TestGCEWorkloadIdentity(t *testing.T) {
 	}
 }
 
+func TestExtractServiceAccountEmail(t *testing.T) {
+	cases := []struct {
+		name        string
+		url         string
+		expected    string
+		expectedErr string
+	}{
+		{
+			name:     "valid URL",
+			url:      "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@my-project.iam.gserviceaccount.com:generateAccessToken",
+			expected: "sa@my-project.iam.gserviceaccount.com",
+		},
+		{
+			name:        "empty URL",
+			url:         "",
+			expectedErr: "service_account_impersonation_url is empty",
+		},
+		{
+			name:        "URL without serviceAccounts segment",
+			url:         "https://iamcredentials.googleapis.com/v1/projects/-/something/else",
+			expectedErr: "unable to extract service account email",
+		},
+		{
+			name:     "URL without generateAccessToken suffix",
+			url:      "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@proj.iam.gserviceaccount.com",
+			expected: "sa@proj.iam.gserviceaccount.com",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			email, err := extractServiceAccountEmail(tc.url)
+			if tc.expectedErr != "" {
+				assert.ErrorContains(t, err, tc.expectedErr)
+			} else {
+				assert.Nil(t, err)
+				assert.Equal(t, tc.expected, email)
+			}
+		})
+	}
+}
+
+func tempExternalAccountCredential(impersonationURL string) (string, error) {
+	fd, err := os.CreateTemp("", "google_external_account_cred")
+	if err != nil {
+		return "", err
+	}
+	defer fd.Close()
+	err = json.NewEncoder(fd).Encode(map[string]interface{}{
+		"type":                              "external_account",
+		"audience":                          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/provider",
+		"subject_token_type":                "urn:ietf:params:aws:token-type:aws4_request",
+		"service_account_impersonation_url": impersonationURL,
+		"token_url":                         "https://sts.googleapis.com/v1/token",
+		"credential_source": map[string]interface{}{
+			"environment_id":                 "aws1",
+			"region_url":                     "http://169.254.169.254/latest/meta-data/placement/availability-zone",
+			"url":                            "http://169.254.169.254/latest/meta-data/iam/security-credentials",
+			"regional_cred_verification_url": "https://sts.{region}.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15",
+		},
+	})
+	return fd.Name(), err
+}
+
+func TestOpenWithExternalAccount(t *testing.T) {
+	ts := testSetup()
+	defer ts.Close()
+
+	impersonationURL := "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@my-project.iam.gserviceaccount.com:generateAccessToken"
+	externalAccountFilePath, err := tempExternalAccountCredential(impersonationURL)
+	assert.Nil(t, err)
+	defer os.Remove(externalAccountFilePath)
+
+	os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", externalAccountFilePath)
+	conn, err := newConnector(&Config{
+		ClientID:           "testClient",
+		ClientSecret:       "testSecret",
+		RedirectURI:        ts.URL + "/callback",
+		Scopes:             []string{"openid", "groups"},
+		DomainToAdminEmail: map[string]string{"*": "admin@example.com"},
+	})
+	assert.Nil(t, err)
+	assert.NotNil(t, conn)
+}
+
+// mockWorkloadIdentityFederation serves a fake Security Token Service and a fake IAM
+// Credentials API. It counts the service account impersonations it serves.
+func mockWorkloadIdentityFederation(impersonations *int) *httptest.Server {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/sts/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token":      "federated-token",
+			"issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+			"token_type":        "Bearer",
+			"expires_in":        3600,
+		})
+	})
+	mux.HandleFunc("/iamcredentials/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer federated-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		*impersonations++
+		w.Header().Add("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"accessToken": "service-account-token",
+			"expireTime":  "2999-01-01T00:00:00Z",
+		})
+	})
+
+	return httptest.NewServer(mux)
+}
+
+func TestWorkloadIdentityFederationWithoutAdminEmail(t *testing.T) {
+	for _, useDefaultCredentials := range []bool{true, false} {
+		name := "service account file path"
+		if useDefaultCredentials {
+			name = "application default credentials"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			var impersonations int
+			wif := mockWorkloadIdentityFederation(&impersonations)
+			defer wif.Close()
+
+			var authorization string
+			directory := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				authorization = r.Header.Get("Authorization")
+				w.Header().Add("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(admin.Groups{Groups: testGroups[r.URL.Query().Get("userKey")]})
+			}))
+			defer directory.Close()
+
+			dir := t.TempDir()
+			subjectTokenFile := dir + "/token"
+			assert.Nil(t, os.WriteFile(subjectTokenFile, []byte("kubernetes-service-account-token"), 0o600))
+
+			credentials, err := json.Marshal(map[string]any{
+				"type":                              "external_account",
+				"audience":                          "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/pool/providers/provider",
+				"subject_token_type":                "urn:ietf:params:oauth:token-type:jwt",
+				"token_url":                         wif.URL + "/sts/token",
+				"service_account_impersonation_url": wif.URL + "/iamcredentials/v1/projects/-/serviceAccounts/dex@example.iam.gserviceaccount.com:generateAccessToken",
+				"credential_source":                 map[string]any{"file": subjectTokenFile},
+			})
+			assert.Nil(t, err)
+			credentialsFile := dir + "/credentials.json"
+			assert.Nil(t, os.WriteFile(credentialsFile, credentials, 0o600))
+
+			config := &Config{
+				ClientID:           "testClient",
+				ClientSecret:       "testSecret",
+				RedirectURI:        directory.URL + "/callback",
+				Scopes:             []string{"openid", "groups"},
+				DomainToAdminEmail: map[string]string{"*": ""},
+			}
+			if useDefaultCredentials {
+				t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credentialsFile)
+			} else {
+				t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+				config.ServiceAccountFilePath = credentialsFile
+			}
+
+			conn, err := newConnector(config)
+			if !assert.Nil(t, err) {
+				return
+			}
+			conn.adminSrv["*"].BasePath = directory.URL + "/"
+
+			groups, err := conn.getGroups("user_2@dexidp.com", false, make(map[string]struct{}))
+			assert.Nil(t, err)
+			assert.Equal(t, []string{"groups_1@dexidp.com"}, groups)
+			// The Directory API is called with the service account token obtained through the
+			// credential's own impersonation step, without a second impersonation of the same
+			// service account.
+			assert.Equal(t, "Bearer service-account-token", authorization)
+			assert.Equal(t, 1, impersonations)
+		})
+	}
+}
+
 func TestPromptTypeConfig(t *testing.T) {
 	promptTypeLogin := "login"
 	cases := []struct {

@@ -406,21 +406,24 @@ func createDirectoryService(serviceAccountFilePath, email string, logger *slog.L
 	ctx := context.Background()
 
 	var jsonCredentials []byte
+	var defaultCreds *google.Credentials
 	var err error
+
+	params := google.CredentialsParams{
+		Scopes: []string{admin.AdminDirectoryGroupReadonlyScope},
+	}
 
 	if serviceAccountFilePath == "" {
 		logger.Warn("the application default credential is used since the service account file path is not used")
-		creds, err := google.FindDefaultCredentialsWithParams(ctx, google.CredentialsParams{
-			Scopes: []string{admin.AdminDirectoryGroupReadonlyScope},
-		})
+		defaultCreds, err = google.FindDefaultCredentialsWithParams(ctx, params)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch application default credentials: %v", err)
 		}
-		if creds.JSON == nil {
+		if defaultCreds.JSON == nil {
 			logger.Info("JSON is empty, using flow for GCE")
 			return createServiceWithMetadataServer(ctx, email, logger)
 		}
-		jsonCredentials = creds.JSON
+		jsonCredentials = defaultCreds.JSON
 	} else {
 		jsonCredentials, err = os.ReadFile(serviceAccountFilePath)
 		if err != nil {
@@ -436,6 +439,23 @@ func createDirectoryService(serviceAccountFilePath, email string, logger *slog.L
 			config.Subject = email
 		}
 		return admin.NewService(ctx, option.WithHTTPClient(config.Client(ctx)))
+	}
+
+	// Without an admin email there is no domain-wide delegation: the credentials call the
+	// Directory API as their own identity, which needs a Workspace admin role (e.g. Groups
+	// Reader) assigned to that identity. The oauth2 library already resolves every credential
+	// type, including the service account impersonation step of workload identity federation,
+	// so no extra impersonation hop (and no Service Account Token Creator grant) is needed.
+	if email == "" {
+		creds := defaultCreds
+		if creds == nil {
+			creds, err = google.CredentialsFromJSONWithTypeAndParams(ctx, jsonCredentials, google.ExternalAccount, params)
+			if err != nil {
+				return nil, fmt.Errorf("unable to parse credentials: %v", err)
+			}
+		}
+		logger.Info("no admin email to impersonate, using the credentials' own identity")
+		return admin.NewService(ctx, option.WithTokenSource(creds.TokenSource))
 	}
 
 	// For other credential types (e.g. external_account), the oauth2 library does not support

@@ -478,6 +478,104 @@ func TestOpenWithExternalAccount(t *testing.T) {
 	assert.NotNil(t, conn)
 }
 
+// mockWorkloadIdentityFederation serves a fake Security Token Service and a fake IAM
+// Credentials API. It counts the service account impersonations it serves.
+func mockWorkloadIdentityFederation(impersonations *int) *httptest.Server {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/sts/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token":      "federated-token",
+			"issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+			"token_type":        "Bearer",
+			"expires_in":        3600,
+		})
+	})
+	mux.HandleFunc("/iamcredentials/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer federated-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		*impersonations++
+		w.Header().Add("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"accessToken": "service-account-token",
+			"expireTime":  "2999-01-01T00:00:00Z",
+		})
+	})
+
+	return httptest.NewServer(mux)
+}
+
+func TestWorkloadIdentityFederationWithoutAdminEmail(t *testing.T) {
+	for _, useDefaultCredentials := range []bool{true, false} {
+		name := "service account file path"
+		if useDefaultCredentials {
+			name = "application default credentials"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			var impersonations int
+			wif := mockWorkloadIdentityFederation(&impersonations)
+			defer wif.Close()
+
+			var authorization string
+			directory := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				authorization = r.Header.Get("Authorization")
+				w.Header().Add("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(admin.Groups{Groups: testGroups[r.URL.Query().Get("userKey")]})
+			}))
+			defer directory.Close()
+
+			dir := t.TempDir()
+			subjectTokenFile := dir + "/token"
+			assert.Nil(t, os.WriteFile(subjectTokenFile, []byte("kubernetes-service-account-token"), 0o600))
+
+			credentials, err := json.Marshal(map[string]any{
+				"type":                              "external_account",
+				"audience":                          "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/pool/providers/provider",
+				"subject_token_type":                "urn:ietf:params:oauth:token-type:jwt",
+				"token_url":                         wif.URL + "/sts/token",
+				"service_account_impersonation_url": wif.URL + "/iamcredentials/v1/projects/-/serviceAccounts/dex@example.iam.gserviceaccount.com:generateAccessToken",
+				"credential_source":                 map[string]any{"file": subjectTokenFile},
+			})
+			assert.Nil(t, err)
+			credentialsFile := dir + "/credentials.json"
+			assert.Nil(t, os.WriteFile(credentialsFile, credentials, 0o600))
+
+			config := &Config{
+				ClientID:           "testClient",
+				ClientSecret:       "testSecret",
+				RedirectURI:        directory.URL + "/callback",
+				Scopes:             []string{"openid", "groups"},
+				DomainToAdminEmail: map[string]string{"*": ""},
+			}
+			if useDefaultCredentials {
+				t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credentialsFile)
+			} else {
+				t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+				config.ServiceAccountFilePath = credentialsFile
+			}
+
+			conn, err := newConnector(config)
+			if !assert.Nil(t, err) {
+				return
+			}
+			conn.adminSrv["*"].BasePath = directory.URL + "/"
+
+			groups, err := conn.getGroups("user_2@dexidp.com", false, make(map[string]struct{}))
+			assert.Nil(t, err)
+			assert.Equal(t, []string{"groups_1@dexidp.com"}, groups)
+			// The Directory API is called with the service account token obtained through the
+			// credential's own impersonation step, without a second impersonation of the same
+			// service account.
+			assert.Equal(t, "Bearer service-account-token", authorization)
+			assert.Equal(t, 1, impersonations)
+		})
+	}
+}
+
 func TestPromptTypeConfig(t *testing.T) {
 	promptTypeLogin := "login"
 	cases := []struct {

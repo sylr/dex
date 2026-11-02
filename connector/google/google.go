@@ -305,14 +305,21 @@ func (c *googleConnector) getGroups(email string, fetchTransitiveGroupMembership
 	var err error
 	groupsList := &admin.Groups{}
 	domain := c.extractDomainFromEmail(email)
-	adminSrv, err := c.findAdminService(domain)
+	adminSrv, adminEmail, err := c.findAdminService(domain)
 	if err != nil {
 		return nil, err
 	}
 
 	for {
-		groupsList, err = adminSrv.Groups.List().
-			UserKey(email).PageToken(groupsList.NextPageToken).Do()
+		call := adminSrv.Groups.List().UserKey(email).PageToken(groupsList.NextPageToken)
+		// Without an admin to impersonate, the caller is a service account outside the
+		// Workspace and the Directory API cannot infer the domain: it answers 404
+		// "Domain not found" unless the domain is given explicitly. With domain-wide
+		// delegation the domain is left out so groups of secondary domains stay visible.
+		if adminEmail == "" && domain != wildcardDomainToAdminEmail {
+			call = call.Domain(domain)
+		}
+		groupsList, err = call.Do()
 		if err != nil {
 			return nil, fmt.Errorf("could not list groups: %v", err)
 		}
@@ -347,18 +354,22 @@ func (c *googleConnector) getGroups(email string, fetchTransitiveGroupMembership
 	return userGroups, nil
 }
 
-func (c *googleConnector) findAdminService(domain string) (*admin.Service, error) {
-	adminSrv, ok := c.adminSrv[domain]
+// findAdminService returns the directory service for the domain, falling back to the
+// wildcard entry, along with the admin email it impersonates ("" when none).
+func (c *googleConnector) findAdminService(domain string) (*admin.Service, string, error) {
+	key := domain
+	adminSrv, ok := c.adminSrv[key]
 	if !ok {
-		adminSrv, ok = c.adminSrv[wildcardDomainToAdminEmail]
-		c.logger.Debug("using wildcard admin email to fetch groups", "admin_email", c.domainToAdminEmail[wildcardDomainToAdminEmail])
+		key = wildcardDomainToAdminEmail
+		adminSrv, ok = c.adminSrv[key]
+		c.logger.Debug("using wildcard admin email to fetch groups", "admin_email", c.domainToAdminEmail[key])
 	}
 
 	if !ok {
-		return nil, fmt.Errorf("unable to find super admin email, domainToAdminEmail for domain: %s not set, %s is also empty", domain, wildcardDomainToAdminEmail)
+		return nil, "", fmt.Errorf("unable to find super admin email, domainToAdminEmail for domain: %s not set, %s is also empty", domain, wildcardDomainToAdminEmail)
 	}
 
-	return adminSrv, nil
+	return adminSrv, c.domainToAdminEmail[key], nil
 }
 
 // extracts the domain name from an email input. If the email is valid, it returns the domain name after the "@" symbol.

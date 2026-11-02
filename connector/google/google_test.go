@@ -523,6 +523,11 @@ func TestWorkloadIdentityFederationWithoutAdminEmail(t *testing.T) {
 			var authorization string
 			directory := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				authorization = r.Header.Get("Authorization")
+				// Like the real Directory API, a caller outside the Workspace must name the domain.
+				if r.URL.Query().Get("domain") != "dexidp.com" {
+					http.Error(w, `{"error":{"code":404,"message":"Domain not found."}}`, http.StatusNotFound)
+					return
+				}
 				w.Header().Add("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(admin.Groups{Groups: testGroups[r.URL.Query().Get("userKey")]})
 			}))
@@ -572,6 +577,67 @@ func TestWorkloadIdentityFederationWithoutAdminEmail(t *testing.T) {
 			// service account.
 			assert.Equal(t, "Bearer service-account-token", authorization)
 			assert.Equal(t, 1, impersonations)
+		})
+	}
+}
+
+func TestGetGroupsDomainParameter(t *testing.T) {
+	for name, tc := range map[string]struct {
+		domainToAdminEmail map[string]string
+		userKey            string
+		expectedDomain     string
+	}{
+		"no admin email for the user's domain": {
+			domainToAdminEmail: map[string]string{"dexidp.com": ""},
+			userKey:            "user_1@dexidp.com",
+			expectedDomain:     "dexidp.com",
+		},
+		"no admin email through the wildcard": {
+			domainToAdminEmail: map[string]string{"*": ""},
+			userKey:            "user_1@dexidp.com",
+			expectedDomain:     "dexidp.com",
+		},
+		"domain-wide delegation": {
+			domainToAdminEmail: map[string]string{"dexidp.com": "admin@dexidp.com"},
+			userKey:            "user_1@dexidp.com",
+			expectedDomain:     "",
+		},
+		"domain-wide delegation through the wildcard": {
+			domainToAdminEmail: map[string]string{"*": "admin@dexidp.com"},
+			userKey:            "user_1@dexidp.com",
+			expectedDomain:     "",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var domains []string
+			directory := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				domains = append(domains, r.URL.Query().Get("domain"))
+				w.Header().Add("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(admin.Groups{Groups: testGroups[r.URL.Query().Get("userKey")]})
+			}))
+			defer directory.Close()
+
+			srv, err := admin.NewService(context.Background(), option.WithoutAuthentication(), option.WithEndpoint(directory.URL))
+			if !assert.Nil(t, err) {
+				return
+			}
+			conn := &googleConnector{
+				logger:             slog.New(slog.DiscardHandler),
+				domainToAdminEmail: tc.domainToAdminEmail,
+				adminSrv:           map[string]*admin.Service{},
+			}
+			for domain := range tc.domainToAdminEmail {
+				conn.adminSrv[domain] = srv
+			}
+
+			groups, err := conn.getGroups(tc.userKey, true, make(map[string]struct{}))
+			assert.Nil(t, err)
+			assert.ElementsMatch(t, []string{"groups_0@dexidp.com", "groups_1@dexidp.com", "groups_2@dexidp.com"}, groups)
+			// Every call, transitive lookups included, carries the expected domain.
+			assert.NotEmpty(t, domains)
+			for _, domain := range domains {
+				assert.Equal(t, tc.expectedDomain, domain)
+			}
 		})
 	}
 }
